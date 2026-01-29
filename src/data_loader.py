@@ -115,11 +115,15 @@ class Recipe1MDataset(data.Dataset):
                 try:
                     with self.image_file.begin(write=False) as txn:
                         image = txn.get(path.encode())
-                        image = np.fromstring(image, dtype=np.uint8)
+                        # np.fromstring is deprecated; keep for backward compatibility but fall back.
+                        try:
+                            image = np.frombuffer(image, dtype=np.uint8)
+                        except Exception:
+                            image = np.fromstring(image, dtype=np.uint8)
                         image = np.reshape(image, (256, 256, 3))
                     image = Image.fromarray(image.astype('uint8'), 'RGB')
-                except:
-                    print ("Image id not found in lmdb. Loading jpeg file...")
+                except Exception:
+                    print("Image id not found in lmdb. Loading jpeg file...")
                     image = Image.open(os.path.join(self.root, path[0], path[1],
                                                     path[2], path[3], path)).convert('RGB')
             else:
@@ -177,7 +181,10 @@ def get_loader(data_dir, aux_data_dir, split, maxseqlen,
                shuffle, num_workers, drop_last=False,
                max_num_samples=-1,
                use_lmdb=False,
-               suff=''):
+               suff='',
+               pin_memory=True,
+               persistent_workers=False,
+               prefetch_factor=2):
 
     dataset = Recipe1MDataset(data_dir=data_dir, aux_data_dir=aux_data_dir, split=split,
                               maxseqlen=maxseqlen, maxnumlabels=maxnumlabels, maxnuminstrs=maxnuminstrs,
@@ -187,7 +194,25 @@ def get_loader(data_dir, aux_data_dir, split, maxseqlen,
                               use_lmdb=use_lmdb,
                               suff=suff)
 
-    data_loader = torch.utils.data.DataLoader(dataset=dataset,
-                                              batch_size=batch_size, shuffle=shuffle, num_workers=num_workers,
-                                              drop_last=drop_last, collate_fn=collate_fn, pin_memory=True)
+    # Some DataLoader kwargs are only valid when num_workers > 0.
+    dl_kwargs = {}
+    dl_kwargs['pin_memory'] = pin_memory
+    if num_workers and num_workers > 0:
+        # persistent_workers/prefetch_factor are ignored/unsupported in very old PyTorch,
+        # so we pass them defensively (try/except on construction).
+        dl_kwargs['persistent_workers'] = persistent_workers
+        dl_kwargs['prefetch_factor'] = prefetch_factor
+
+    try:
+        data_loader = torch.utils.data.DataLoader(dataset=dataset,
+                                                  batch_size=batch_size, shuffle=shuffle, num_workers=num_workers,
+                                                  drop_last=drop_last, collate_fn=collate_fn, **dl_kwargs)
+    except TypeError:
+        # Backward compatibility (old torch): drop unsupported kwargs.
+        dl_kwargs.pop('persistent_workers', None)
+        dl_kwargs.pop('prefetch_factor', None)
+        data_loader = torch.utils.data.DataLoader(dataset=dataset,
+                                                  batch_size=batch_size, shuffle=shuffle, num_workers=num_workers,
+                                                  drop_last=drop_last, collate_fn=collate_fn, **dl_kwargs)
+
     return data_loader, dataset

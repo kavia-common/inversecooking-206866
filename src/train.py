@@ -3,23 +3,20 @@
 from args import get_parser
 import torch
 import torch.nn as nn
-import torch.autograd as autograd
 import numpy as np
 import os
 import random
 import pickle
 from data_loader import get_loader
-from build_vocab import Vocabulary
 from model import get_model
 from torchvision import transforms
 import sys
-import json
 import time
 import torch.backends.cudnn as cudnn
 from utils.tb_visualizer import Visualizer
 from model import mask_from_eos, label2onehot
 from utils.metrics import softIoU, compute_metrics, update_error_types
-import random
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 map_loc = None if torch.cuda.is_available() else 'cpu'
 
@@ -67,6 +64,30 @@ def make_dir(d):
         os.makedirs(d)
 
 
+def _try_set_matmul_precision(matmul_precision: str) -> None:
+    """Best-effort torch.set_float32_matmul_precision (PyTorch 2.x)."""
+    if not matmul_precision:
+        return
+    try:
+        torch.set_float32_matmul_precision(matmul_precision)
+        print("Set torch float32 matmul precision to:", matmul_precision)
+    except Exception:
+        print("Warning: matmul_precision flag ignored (torch.set_float32_matmul_precision not available).")
+
+
+def _try_compile_model(model, enabled: bool):
+    """Best-effort torch.compile (PyTorch 2.x)."""
+    if not enabled:
+        return model
+    try:
+        compiled = torch.compile(model)
+        print("Using torch.compile() for model execution.")
+        return compiled
+    except Exception as e:
+        print("Warning: torch.compile failed/unsupported; continuing without compile. Error:", str(e))
+        return model
+
+
 def main(args):
 
     # Create model directory & other aux folders for logging
@@ -88,12 +109,15 @@ def main(args):
 
     # logs to disk
     if not args.log_term:
-        print ("Training logs will be saved to:", os.path.join(logs_dir, 'train.log'))
+        print("Training logs will be saved to:", os.path.join(logs_dir, 'train.log'))
         sys.stdout = open(os.path.join(logs_dir, 'train.log'), 'w')
         sys.stderr = open(os.path.join(logs_dir, 'train.err'), 'w')
 
     print(args)
     pickle.dump(args, open(os.path.join(checkpoints_dir, 'args.pkl'), 'wb'))
+
+    # perf knobs (no-op on unsupported torch versions)
+    _try_set_matmul_precision(getattr(args, 'matmul_precision', ''))
 
     # patience init
     curr_pat = 0
@@ -121,6 +145,12 @@ def main(args):
 
         transform = transforms.Compose(transforms_list)
         max_num_samples = max(args.max_eval, args.batch_size) if split == 'val' else -1
+
+        # keep legacy behavior unless user opts in with --pin_memory/--persistent_workers
+        pin_memory = getattr(args, 'pin_memory', False)
+        persistent_workers = getattr(args, 'persistent_workers', False)
+        prefetch_factor = getattr(args, 'prefetch_factor', 2)
+
         data_loaders[split], datasets[split] = get_loader(data_dir, args.aux_data_dir, split,
                                                           args.maxseqlen,
                                                           args.maxnuminstrs,
@@ -131,7 +161,10 @@ def main(args):
                                                           drop_last=True,
                                                           max_num_samples=max_num_samples,
                                                           use_lmdb=args.use_lmdb,
-                                                          suff=args.suff)
+                                                          suff=args.suff,
+                                                          pin_memory=pin_memory,
+                                                          persistent_workers=persistent_workers,
+                                                          prefetch_factor=prefetch_factor)
 
     ingr_vocab_size = datasets[split].get_ingrs_vocab_size()
     instrs_vocab_size = datasets[split].get_instrs_vocab_size()
@@ -156,15 +189,15 @@ def main(args):
         params += list(model.image_encoder.linear.parameters())
     params_cnn = list(model.image_encoder.resnet.parameters())
 
-    print ("CNN params:", sum(p.numel() for p in params_cnn if p.requires_grad))
-    print ("decoder params:", sum(p.numel() for p in params if p.requires_grad))
+    print("CNN params:", sum(p.numel() for p in params_cnn if p.requires_grad))
+    print("decoder params:", sum(p.numel() for p in params if p.requires_grad))
     # start optimizing cnn from the beginning
     if params_cnn is not None and args.finetune_after == 0:
         optimizer = torch.optim.Adam([{'params': params}, {'params': params_cnn,
                                                            'lr': args.learning_rate*args.scale_learning_rate_cnn}],
                                      lr=args.learning_rate, weight_decay=args.weight_decay)
         keep_cnn_gradients = True
-        print ("Fine tuning resnet")
+        print("Fine tuning resnet")
     else:
         optimizer = torch.optim.Adam(params, lr=args.learning_rate)
 
@@ -190,15 +223,32 @@ def main(args):
         model = nn.DataParallel(model)
 
     model = model.to(device)
+
+    # Optional channels_last for CNN throughput
+    if getattr(args, 'channels_last', False) and device.type == 'cuda':
+        try:
+            model = model.to(memory_format=torch.channels_last)
+            print("Using channels_last memory format.")
+        except Exception:
+            print("Warning: channels_last not supported; continuing with default memory format.")
+
     cudnn.benchmark = True
+
+    # Optional compile (best effort)
+    model = _try_compile_model(model, getattr(args, 'compile', False))
+
+    # AMP scaler (only used if --amp and CUDA available)
+    use_amp = bool(getattr(args, 'amp', False) and device.type == 'cuda')
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    non_blocking = bool(getattr(args, 'non_blocking', False) and device.type == 'cuda')
 
     if not hasattr(args, 'current_epoch'):
         args.current_epoch = 0
 
     es_best = 10000 if args.es_metric == 'loss' else 0
     # Train the model
-    start = args.current_epoch
-    for epoch in range(start, args.num_epochs):
+    start_epoch = args.current_epoch
+    for epoch in range(start_epoch, args.num_epochs):
 
         # save current epoch for resuming
         if args.tensorboard:
@@ -210,7 +260,7 @@ def main(args):
             frac = epoch // args.lr_decay_every
             decay_factor = args.lr_decay_rate ** frac
             new_lr = args.learning_rate*decay_factor
-            print ('Epoch %d. lr: %.5f'%(epoch, new_lr))
+            print('Epoch %d. lr: %.5f' % (epoch, new_lr))
             set_lr(optimizer, decay_factor)
 
         if args.finetune_after != -1 and args.finetune_after < epoch \
@@ -230,8 +280,8 @@ def main(args):
                 model.train()
             else:
                 model.eval()
+
             total_step = len(data_loaders[split])
-            loader = iter(data_loaders[split])
 
             total_loss_dict = {'recipe_loss': [], 'ingr_loss': [],
                                'eos_loss': [], 'loss': [],
@@ -242,26 +292,41 @@ def main(args):
             error_types = {'tp_i': 0, 'fp_i': 0, 'fn_i': 0, 'tn_i': 0,
                            'tp_all': 0, 'fp_all': 0, 'fn_all': 0}
 
-            torch.cuda.synchronize()
-            start = time.time()
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            start_time = time.time()
 
-            for i in range(total_step):
+            # Iterate directly over the DataLoader (faster and avoids .next() overhead)
+            for i, batch in enumerate(data_loaders[split]):
 
-                img_inputs, captions, ingr_gt, img_ids, paths = loader.next()
+                img_inputs, captions, ingr_gt, img_ids, paths = batch
 
-                ingr_gt = ingr_gt.to(device)
-                img_inputs = img_inputs.to(device)
-                captions = captions.to(device)
+                ingr_gt = ingr_gt.to(device, non_blocking=non_blocking)
+                img_inputs = img_inputs.to(device, non_blocking=non_blocking)
+                captions = captions.to(device, non_blocking=non_blocking)
+
+                # Optional channels_last on inputs
+                if getattr(args, 'channels_last', False) and device.type == 'cuda':
+                    try:
+                        img_inputs = img_inputs.contiguous(memory_format=torch.channels_last)
+                    except Exception:
+                        pass
+
                 true_caps_batch = captions.clone()[:, 1:].contiguous()
                 loss_dict = {}
 
                 if split == 'val':
+                    # validation: inference only
                     with torch.no_grad():
-                        losses = model(img_inputs, captions, ingr_gt)
+                        # autocast for val if enabled; keeps behavior close, but faster on GPU
+                        autocast_ctx = torch.cuda.amp.autocast(enabled=use_amp)
+                        with autocast_ctx:
+                            losses = model(img_inputs, captions, ingr_gt)
+
+                            if not args.recipe_only:
+                                outputs = model(img_inputs, captions, ingr_gt, sample=True)
 
                         if not args.recipe_only:
-                            outputs = model(img_inputs, captions, ingr_gt, sample=True)
-
                             ingr_ids_greedy = outputs['ingr_ids']
 
                             mask = mask_from_eos(ingr_ids_greedy, eos_value=0, mult_before=False)
@@ -277,8 +342,11 @@ def main(args):
                             del outputs, pred_one_hot, target_one_hot, iou_sample
 
                 else:
-                    losses = model(img_inputs, captions, ingr_gt,
-                                   keep_cnn_gradients=keep_cnn_gradients)
+                    # training step
+                    autocast_ctx = torch.cuda.amp.autocast(enabled=use_amp)
+                    with autocast_ctx:
+                        losses = model(img_inputs, captions, ingr_gt,
+                                       keep_cnn_gradients=keep_cnn_gradients)
 
                 if not args.ingrs_only:
                     recipe_loss = losses['recipe_loss']
@@ -325,13 +393,19 @@ def main(args):
                     total_loss_dict[key].append(loss_dict[key])
 
                 if split == 'train':
-                    model.zero_grad()
-                    loss.backward()
-                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                    if use_amp:
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        optimizer.step()
 
                 # Print log info
                 if args.log_step != -1 and i % args.log_step == 0:
-                    elapsed_time = time.time()-start
+                    elapsed_time = time.time()-start_time
                     lossesstr = ""
                     for k in total_loss_dict.keys():
                         if len(total_loss_dict[k]) == 0:
@@ -347,12 +421,13 @@ def main(args):
                     print(strtoprint)
 
                     if args.tensorboard:
-                        # logger.histo_summary(model=model, step=total_step * epoch + i)
                         logger.scalar_summary(mode=split+'_iter', epoch=total_step*epoch+i,
                                               **{k: np.mean(v[-args.log_step:]) for k, v in total_loss_dict.items() if v})
 
-                    torch.cuda.synchronize()
-                    start = time.time()
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize()
+                    start_time = time.time()
+
                 del loss, losses, captions, img_inputs
 
             if split == 'val' and not args.recipe_only:

@@ -163,6 +163,42 @@ def get_parser():
                         help='if used, true ingredients will be used as input to obtain the recipe in evaluation')
     parser.set_defaults(use_true_ingrs=False)
 
+    # -------------------------
+    # Performance-related flags
+    # -------------------------
+    # Defaults preserve original behavior. These are opt-in.
+    parser.add_argument('--amp', dest='amp', action='store_true',
+                        help='enable mixed precision training/inference via torch.cuda.amp (if available)')
+    parser.set_defaults(amp=False)
+
+    parser.add_argument('--channels_last', dest='channels_last', action='store_true',
+                        help='use channels_last memory format for image tensors (can improve CNN throughput on GPU)')
+    parser.set_defaults(channels_last=False)
+
+    parser.add_argument('--compile', dest='compile', action='store_true',
+                        help='try to torch.compile() the model (PyTorch 2.x only). Safe no-op on older versions.')
+    parser.set_defaults(compile=False)
+
+    parser.add_argument('--matmul_precision', type=str, default='',
+                        choices=['', 'highest', 'high', 'medium'],
+                        help='if set, calls torch.set_float32_matmul_precision() (PyTorch 2.x only)')
+
+    parser.add_argument('--non_blocking', dest='non_blocking', action='store_true',
+                        help='use non_blocking=True when moving tensors to CUDA (requires pin_memory=True in DataLoader)')
+    parser.set_defaults(non_blocking=False)
+
+    # DataLoader tuning (kept optional to preserve exact legacy behavior).
+    parser.add_argument('--pin_memory', dest='pin_memory', action='store_true',
+                        help='enable DataLoader pin_memory for faster H2D transfer')
+    parser.set_defaults(pin_memory=False)
+
+    parser.add_argument('--persistent_workers', dest='persistent_workers', action='store_true',
+                        help='keep DataLoader workers alive between epochs (PyTorch>=1.7).')
+    parser.set_defaults(persistent_workers=False)
+
+    parser.add_argument('--prefetch_factor', type=int, default=2,
+                        help='DataLoader prefetch_factor when num_workers>0 (PyTorch>=1.7).')
+
     args = parser.parse_args()
 
     return args

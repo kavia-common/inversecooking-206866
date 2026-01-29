@@ -10,11 +10,10 @@ from build_vocab import Vocabulary
 from model import get_model
 from tqdm import tqdm
 from data_loader import get_loader
-import json
 import sys
-from model import mask_from_eos
 import random
 from utils.metrics import softIoU, update_error_types, compute_metrics
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 map_loc = None if torch.cuda.is_available() else 'cpu'
 
@@ -45,6 +44,37 @@ def label2onehot(labels, pad_value):
     return one_hot
 
 
+def _inference_context(use_amp: bool):
+    """Return a context manager for fast inference (inference_mode if available, else no_grad)."""
+    # inference_mode is faster than no_grad for inference-only loops (PyTorch>=1.9).
+    try:
+        base_ctx = torch.inference_mode()
+    except Exception:
+        base_ctx = torch.no_grad()
+
+    if device.type == 'cuda':
+        amp_ctx = torch.cuda.amp.autocast(enabled=use_amp)
+    else:
+        # no autocast on CPU in this codebase for compatibility
+        class _NullCtx(object):
+            def __enter__(self): return None
+            def __exit__(self, exc_type, exc, tb): return False
+        amp_ctx = _NullCtx()
+
+    # simple combined ctx
+    class _Combined(object):
+        def __enter__(self_inner):
+            base_ctx.__enter__()
+            amp_ctx.__enter__()
+            return None
+
+        def __exit__(self_inner, exc_type, exc, tb):
+            amp_ctx.__exit__(exc_type, exc, tb)
+            return base_ctx.__exit__(exc_type, exc, tb)
+
+    return _Combined()
+
+
 def main(args):
 
     where_to_save = os.path.join(args.save_dir, args.project_name, args.model_name)
@@ -52,20 +82,23 @@ def main(args):
     logs_dir = os.path.join(where_to_save, 'logs')
 
     if not args.log_term:
-        print ("Eval logs will be saved to:", os.path.join(logs_dir, 'eval.log'))
+        print("Eval logs will be saved to:", os.path.join(logs_dir, 'eval.log'))
         sys.stdout = open(os.path.join(logs_dir, 'eval.log'), 'w')
         sys.stderr = open(os.path.join(logs_dir, 'eval.err'), 'w')
 
     vars_to_replace = ['greedy', 'recipe_only', 'ingrs_only', 'temperature', 'batch_size', 'maxseqlen',
                        'get_perplexity', 'use_true_ingrs', 'eval_split', 'save_dir', 'aux_data_dir',
-                       'recipe1m_dir', 'project_name', 'use_lmdb', 'beam']
+                       'recipe1m_dir', 'project_name', 'use_lmdb', 'beam', 'amp', 'channels_last', 'non_blocking',
+                       'pin_memory', 'persistent_workers', 'prefetch_factor', 'compile', 'matmul_precision']
     store_dict = {}
     for var in vars_to_replace:
-        store_dict[var] = getattr(args, var)
+        if hasattr(args, var):
+            store_dict[var] = getattr(args, var)
     args = pickle.load(open(os.path.join(checkpoints_dir, 'args.pkl'), 'rb'))
     for var in vars_to_replace:
-        setattr(args, var, store_dict[var])
-    print (args)
+        if var in store_dict:
+            setattr(args, var, store_dict[var])
+    print(args)
 
     transforms_list = []
     transforms_list.append(transforms.Resize((args.crop_size)))
@@ -78,12 +111,19 @@ def main(args):
 
     # data loader
     data_dir = args.recipe1m_dir
+    pin_memory = getattr(args, 'pin_memory', False)
+    persistent_workers = getattr(args, 'persistent_workers', False)
+    prefetch_factor = getattr(args, 'prefetch_factor', 2)
+
     data_loader, dataset = get_loader(data_dir, args.aux_data_dir, args.eval_split,
                                       args.maxseqlen, args.maxnuminstrs, args.maxnumlabels,
                                       args.maxnumims, transform, args.batch_size,
                                       shuffle=False, num_workers=args.num_workers,
                                       drop_last=False, max_num_samples=-1,
-                                      use_lmdb=args.use_lmdb, suff=args.suff)
+                                      use_lmdb=args.use_lmdb, suff=args.suff,
+                                      pin_memory=pin_memory,
+                                      persistent_workers=persistent_workers,
+                                      prefetch_factor=prefetch_factor)
 
     ingr_vocab_size = dataset.get_ingrs_vocab_size()
     instrs_vocab_size = dataset.get_instrs_vocab_size()
@@ -103,6 +143,14 @@ def main(args):
 
     model.eval()
     model = model.to(device)
+
+    # Optional channels_last
+    if getattr(args, 'channels_last', False) and device.type == 'cuda':
+        try:
+            model = model.to(memory_format=torch.channels_last)
+        except Exception:
+            pass
+
     results_dict = {'recipes': {}, 'ingrs': {}, 'ingr_iou': {}}
     captions = {}
     iou = []
@@ -110,17 +158,26 @@ def main(args):
     perplexity_list = []
     n_rep, th = 0, 0.3
 
+    use_amp = bool(getattr(args, 'amp', False) and device.type == 'cuda')
+    non_blocking = bool(getattr(args, 'non_blocking', False) and device.type == 'cuda')
+
     for i, (img_inputs, true_caps_batch, ingr_gt, imgid, impath) in tqdm(enumerate(data_loader)):
 
-        ingr_gt = ingr_gt.to(device)
-        true_caps_batch = true_caps_batch.to(device)
+        ingr_gt = ingr_gt.to(device, non_blocking=non_blocking)
+        true_caps_batch = true_caps_batch.to(device, non_blocking=non_blocking)
 
         true_caps_shift = true_caps_batch.clone()[:, 1:].contiguous()
-        img_inputs = img_inputs.to(device)
+        img_inputs = img_inputs.to(device, non_blocking=non_blocking)
+
+        if getattr(args, 'channels_last', False) and device.type == 'cuda':
+            try:
+                img_inputs = img_inputs.contiguous(memory_format=torch.channels_last)
+            except Exception:
+                pass
 
         true_ingrs = ingr_gt if args.use_true_ingrs else None
         for gens in range(args.numgens):
-            with torch.no_grad():
+            with _inference_context(use_amp=use_amp):
 
                 if args.get_perplexity:
 
@@ -168,9 +225,10 @@ def main(args):
                             if imgid[j] not in captions.keys():
                                 results_dict['recipes'][imgid[j]] = []
                                 results_dict['recipes'][imgid[j]].append(sampled_ids)
+
     if args.get_perplexity:
-        print (len(perplexity_list))
-        print (np.mean(perplexity_list))
+        print(len(perplexity_list))
+        print(np.mean(perplexity_list))
     else:
 
         if not args.recipe_only:
@@ -180,7 +238,7 @@ def main(args):
                             weights=None)
 
             for k, v in ret_metrics.items():
-                print (k, np.mean(v))
+                print(k, np.mean(v))
 
         if args.greedy:
             suff = 'greedy'
@@ -192,10 +250,10 @@ def main(args):
 
         results_file = os.path.join(args.save_dir, args.project_name, args.model_name, 'checkpoints',
                                     args.eval_split + '_' + suff + '_gencaps.pkl')
-        print (results_file)
+        print(results_file)
         pickle.dump(results_dict, open(results_file, 'wb'))
 
-        print ("Number of samples with excessive repetitions:", n_rep)
+        print("Number of samples with excessive repetitions:", n_rep)
 
 
 if __name__ == '__main__':
